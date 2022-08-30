@@ -1,6 +1,221 @@
 #define OLC_PGE_APPLICATION
 #include "olcPixelGameEngine.h"
 
+#define OLC_SOUNDWAVE
+#include "olcSoundWaveEngine.h"
+
+#include <mutex>
+#include <numeric>
+
+template<typename T>
+[[nodiscard]] T lerp(const T& v0, const T& v1, float t) noexcept {
+	return v0 * (1.0f - t) + v1 * t;
+}
+//Map a value val that is between in_start and end_start to the range out_start out_end
+template<class T, class U>
+[[nodiscard]] U map(T in_start, T in_end, U out_start, U out_end, T val) noexcept {
+	auto t = std::clamp<U>((val - in_start) / (in_end - in_start), 0.0, 1.0);
+
+	return lerp(out_start, out_end, t);
+}
+
+//A simple mixer with N inputs
+template<size_t N>
+class Mixer : public olc::sound::synth::Module {
+public:
+	std::array<olc::sound::synth::Property, N> inputs = {};
+	std::array<olc::sound::synth::Property, N> amplitude = {};
+	olc::sound::synth::Property output;
+
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		double out = 0.0f;
+
+		for (size_t i = 0; i < N; i++) {
+			out += amplitude[i].value * inputs[i].value;
+		}
+
+		output = out / N;
+	}
+};
+
+template<size_t max_ms, size_t samplerate>
+class Delay : public olc::sound::synth::Module {
+
+public:
+	olc::sound::synth::Property input = 0.0;
+	olc::sound::synth::Property output = 0.0;
+	olc::sound::synth::Property decay = 1.0;
+	olc::sound::synth::Property delay = 1.0;
+	std::array<double, (max_ms * samplerate) / 1000> state{0.0};
+private:
+	double max_delay = static_cast<double>(max_ms) / 1000.0;
+	size_t input_index = 0;
+	size_t output_index = 1;
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		state[input_index] = input.value * decay.value;
+		input_index = (input_index + 1) % state.size();
+
+		//Determine where we should sample from based on the desired delay amount
+		size_t out_dist = std::min(state.size() - 1, static_cast<size_t>(delay.value * max_delay * samplerate));
+		output_index = (input_index - out_dist + state.size()) % state.size();
+		output = state[output_index];
+	}
+};
+
+//A simple DSP style first order filter
+class FirstOrderFilter : public olc::sound::synth::Module {
+public:
+	FirstOrderFilter(double p, double z) : pole(p), zero(z) {};
+	olc::sound::synth::Property pole;
+	olc::sound::synth::Property zero;
+	olc::sound::synth::Property state = 0.0;
+	olc::sound::synth::Property input = 0.0;
+	olc::sound::synth::Property output = 0.0;
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		double new_state = input.value + pole.value * state.value;
+		output = new_state - zero.value * state.value;
+		state = new_state;
+	}
+};
+
+class Gain : public olc::sound::synth::Module {
+private:
+	double max_gain = 2;
+public:
+	olc::sound::synth::Property gain = 1.0;
+	olc::sound::synth::Property input = 0.0;
+	olc::sound::synth::Property output = 0.0;
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		output.value = max_gain * gain.value * input.value;
+	}
+};
+
+class LPF : public olc::sound::synth::Module {
+public:
+	std::array<double, 13> taps = { 0.000035,
+0.000928,
+0.004561,
+0.012669,
+0.024443,
+0.035453,
+0.040000,
+0.035453,
+0.024443,
+0.012669,
+0.004561,
+0.000928,
+0.000035 };
+	std::array<double, 13> state = { 0 };
+	olc::sound::synth::Property input = 0.0;
+	olc::sound::synth::Property output = 0.0;
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		double o = 0.0;
+		for (size_t i = 12; i > 0; i--) {
+			state[i] = state[i - 1];
+		}
+
+		state[0] = input.value;
+
+		for (size_t i = 0; i < 13; i++) {
+			o += taps[i] * state[i];
+		}
+		output.value = 2*o;
+	}
+
+};
+
+//Approximately filters white noise into pink noise
+class Pinkifier : public olc::sound::synth::Module {
+	FirstOrderFilter f1 = { 0.99572754 , 0.98443604};
+	FirstOrderFilter f2 = { 0.94790649 , 0.83392334 };
+	FirstOrderFilter f3 = { 0.53567505 , 0.07568359 };
+
+public:
+	olc::sound::synth::Property input = 0.0f;
+	olc::sound::synth::Property output = 0.0f;
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		f1.input = input;
+		f1.Update(nChannel, dTime, dTimeStep);
+		f2.input = f1.output;
+		f2.Update(nChannel, dTime, dTimeStep);
+		f3.input = f2.output;
+		f3.Update(nChannel, dTime, dTimeStep);
+		output = f3.output;
+	}
+};
+
+class ADSREnvelope : public olc::sound::synth::Module {
+private:
+	enum class ADSR_STATE {
+		INACTIVE,
+		ATTACK,
+		DECAY,
+		SUSTAIN,
+		RELEASE
+	} mState = ADSR_STATE::INACTIVE;
+
+	std::mutex m;
+
+public:
+	olc::sound::synth::Property mInput = 0.0;
+	olc::sound::synth::Property mAttack = 0.0f;
+	olc::sound::synth::Property mDecay = 0.00f;
+	olc::sound::synth::Property mSustain = 1.0f;
+	olc::sound::synth::Property mRelease = 1.0f;
+	//double mRelease = 4.0f;
+	olc::sound::synth::Property mAmplitude = 0.0f;
+	olc::sound::synth::Property mReleaseAmplitude = 0.00f;
+	olc::sound::synth::Property mOutput = 0.0f;
+	olc::sound::synth::Property mReleaseTime = 0.0f;
+	double mTotalTime = 0.0f;
+
+public:
+
+	void Begin() {
+		std::scoped_lock lock(m);
+		mTotalTime = 0.0f;
+		mReleaseTime = 0.0f;
+		mState = ADSR_STATE::ATTACK;
+	}
+
+	void End() {
+		std::scoped_lock lock(m);
+		mReleaseTime = mTotalTime;
+		mReleaseAmplitude = mAmplitude;
+		mState = ADSR_STATE::RELEASE;
+	}
+
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		std::scoped_lock lock(m);
+
+		mTotalTime += dTimeStep;
+
+		switch (mState) {
+		case ADSR_STATE::INACTIVE:
+			mOutput = 0.0;
+			break;
+		case ADSR_STATE::ATTACK:
+			mAmplitude = map<>(0.0, mAttack.value, 0.0, 1.0, mTotalTime);
+			if (mTotalTime > mAttack.value) mState = ADSR_STATE::DECAY;
+			break;
+		case ADSR_STATE::DECAY:
+			mAmplitude = map<>(mAttack.value, mAttack.value + mDecay.value, 1.0, mSustain.value, mTotalTime);
+			if (mTotalTime > mAttack.value + mDecay.value) mState = ADSR_STATE::SUSTAIN;
+			break;
+		case ADSR_STATE::SUSTAIN:
+			mReleaseTime = mTotalTime;
+			mReleaseAmplitude = mAmplitude;
+			mState = ADSR_STATE::RELEASE;
+			break;
+		case ADSR_STATE::RELEASE:
+			mAmplitude = map<>(mReleaseTime.value, mReleaseTime.value + mRelease.value, mReleaseAmplitude.value, 0.0, mTotalTime);
+			break;
+			//No default as all cases are taken care of
+		}
+
+		mOutput = mAmplitude.value * mInput.value;
+	}
+};
 
 struct LineSegment {
 	olc::vf2d start;
@@ -16,8 +231,7 @@ float rand_float() {
 	return ((float)rand()) / RAND_MAX;
 }
 
-
-
+const uint32_t samplerate = 44100;
 const float split_chance = 0.3f;
 const float split_alpha_mod = 0.5f;
 const olc::Pixel white = { 255, 255, 255, 255 };
@@ -127,6 +341,8 @@ public:
 	}
 
 public:
+	
+
 	bool OnUserCreate() override
 	{
 		// Called once at the start, so create things here
@@ -139,8 +355,85 @@ public:
 			title_fmod[i] = rand_float();
 		}
 
+		osc1.waveform = olc::sound::synth::modules::Oscillator::Type::Noise;
+		osc2.waveform = olc::sound::synth::modules::Oscillator::Type::Saw;
+
+		osc1.frequency = .25;
+		osc1.amplitude = 1.0;
+		osc1.parameter = 0.5;
+
+		osc1.amplitude = 1.0;
+
+		adsr2.mRelease = 2.5;
+		mixer.amplitude[0] = 1.0;
+		mixer.amplitude[1] = 1.0;
+		mixer.amplitude[2] = 1.0;
+
+		delay.decay = .55;
+
+		synth.AddModule(&osc1);
+		synth.AddModule(&osc2);
+		synth.AddModule(&pink_filter);
+		synth.AddModule(&adsr);
+		synth.AddModule(&adsr2);
+		synth.AddModule(&delay);
+		synth.AddModule(&mixer);
+		synth.AddModule(&lpf);
+		synth.AddModule(&gain);
+
+		synth.AddPatch(&osc1.output, &delay.input);
+		synth.AddPatch(&osc1.output, &mixer.inputs[0]);
+		synth.AddPatch(&osc1.output, &lpf.input);
+		synth.AddPatch(&delay.output, &mixer.inputs[1]);
+		synth.AddPatch(&lpf.output, &mixer.inputs[2]);
+		synth.AddPatch(&mixer.output, &gain.input);
+		synth.AddPatch(&gain.output, &pink_filter.input);
+		synth.AddPatch(&pink_filter.output, &adsr.mInput);
+		synth.AddPatch(&adsr.mOutput, &adsr2.mInput);
+
+		engine.InitialiseAudio(samplerate, 1, 8, 512);
+
+		engine.SetCallBack_NewSample([this](double dTime) {return Synthesizer_OnNewCycleRequest(dTime); });
+		engine.SetCallBack_SynthFunction([this](uint32_t nChannel, double dTime) {return Synthesizer_OnGetSample(nChannel, dTime); });
+
 		return true;
 	}
+
+	bool OnUserDestroy() {
+		engine.DestroyAudio();
+		return true;
+	}
+
+	void Synthesizer_OnNewCycleRequest(double dTime)
+	{
+		synth.UpdatePatches();
+	}
+
+	// Called individually per sample per channel
+	// Useful for actual sound synthesis
+	float Synthesizer_OnGetSample(uint32_t nChannel, double dTime)
+	{
+		static double last_time = 0.0;
+		//synth.Update(nChannel, dTime, dTime - last_time);
+		synth.Update(nChannel, dTime, 1.0 / 44100.0);
+		last_time = dTime;
+		return adsr2.mOutput.value;
+	}
+
+
+	olc::sound::WaveEngine engine;
+	olc::sound::synth::ModularSynth synth;
+	olc::sound::synth::modules::Oscillator osc1;
+	olc::sound::synth::modules::Oscillator osc2;
+	ADSREnvelope adsr;
+	ADSREnvelope adsr2;
+	Pinkifier pink_filter;
+	Delay<2000, samplerate> delay;
+	Mixer<3> mixer;
+	LPF lpf;
+	Gain gain;
+
+	int times_called = 0;
 
 	std::string title = "VENUS SIGIL";
 	std::array<olc::Pixel, 11> title_colors;
@@ -153,14 +446,15 @@ public:
 
 	float fTotalTime = 0.0f;
 	float fStateTimer = 0.0f;
-	float fIdleThreshold = 8.0f;
+	float fIdleThreshold = 4.0f;
+	float fIdleThresholdMax = 4.0f;
 	float fHintThreshold = 1.0f;
 	float fTriggerThreshold = .5f;
 	float fShowThreshold = 2.0f;
 	float fFadeoutThreshold = 0.3f;
 
 
-	float fSpeed = 15.0f;
+	float fSpeed = 19.0f;
 
 	int bolts_dodged = 0;
 
@@ -170,7 +464,7 @@ public:
 
 	void Reset() {
 		fStateTimer = 0.0f;
-		fIdleThreshold = 8.0f;
+		fIdleThreshold = fIdleThresholdMax;
 		fHintThreshold = 1.0f;
 		fTriggerThreshold = .5f;
 		fShowThreshold = 2.0f;
@@ -245,11 +539,20 @@ public:
 			
 			float x1 = rand_float() * ScreenWidth();
 			float x2 = rand_float() * ScreenWidth();
+			float m_x = rand_float() * 30.0f - 15.0f;
+			float m_y = rand_float() * 30.0f - 15.0f;
+			olc::vf2d mp = { hint_point.x + m_x, hint_point.y + m_y };
 
-			bolt = Bolt({ x1, 0.0f }, { x2, (float)ScreenHeight() });
+			//bolt = Bolt({ x1, 0.0f }, { x2, (float)ScreenHeight() });
+			bolt = Bolt({ x1, 0.0f }, { mp });
+			bolt.segments.push_back({ mp, { x2, (float)ScreenHeight() } , white });
 
 			float r = rand_float();
-			float limit = r * 6 + 5;
+			float limit = r * 6 + 4;
+
+			delay.delay = 0.1 + r * (0.9);
+			mixer.amplitude[2] = rand_float();
+			gain.gain = r;
 
 			fTriggerThreshold = 0.1f + r / 10.0f;
 
@@ -257,7 +560,7 @@ public:
 				bolt.Iterate();
 			}
 
-			fIdleThreshold = std::max(.50f, 8 - bolts_dodged * 0.3f);
+			fIdleThreshold = std::max(.50f, fIdleThresholdMax - bolts_dodged * 0.1f);
 		}
 	}
 
@@ -269,6 +572,8 @@ public:
 		if (fStateTimer > fHintThreshold) {
 			fStateTimer -= fHintThreshold;
 			mode = eMode::TRIGGER;
+			adsr.Begin();
+			adsr2.Begin();
 		}
 
 		for (const auto& s : bolt.segments) {
@@ -304,7 +609,6 @@ public:
 		if (fStateTimer > fShowThreshold) {
 			fStateTimer -= fShowThreshold;
 			mode = eMode::FADEOUT;
-
 			fShowThreshold = std::max(0.5f, 2.0f - bolts_dodged * 0.007f);
 
 		}
@@ -456,6 +760,11 @@ public:
 				Draw(hint_point + p, olc::GREEN);
 			}
 		}
+
+		//DrawString(20, 40, std::to_string(adsr.mTotalTime));
+		//DrawString(20, 50, std::to_string(times_called));
+		//DrawString(20, 60, std::to_string(fTotalTime));
+		//DrawString(20, 70, std::to_string(fTotalTime*44100));
 
 		if (dead) {
 			mode = eMode::DIE;
