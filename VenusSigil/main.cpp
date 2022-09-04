@@ -4,20 +4,57 @@
 #define OLC_SOUNDWAVE
 #include "olcSoundWaveEngine.h"
 
+#include "BiQuadFilter.h"
+
 #include <mutex>
 #include <numeric>
+
+const uint32_t samplerate = 44100;
+
 
 template<typename T>
 [[nodiscard]] T lerp(const T& v0, const T& v1, float t) noexcept {
 	return v0 * (1.0f - t) + v1 * t;
 }
-//Map a value val that is between in_start and end_start to the range out_start out_end
+//Map a value val that is between in_start and in_end to the range out_start out_end
 template<class T, class U>
 [[nodiscard]] U map(T in_start, T in_end, U out_start, U out_end, T val) noexcept {
 	auto t = std::clamp<U>((val - in_start) / (in_end - in_start), 0.0, 1.0);
 
 	return lerp(out_start, out_end, t);
 }
+
+float rand_float() {
+	return ((float)rand()) / RAND_MAX;
+}
+
+//class BiquadFilter : public olc::sound::synth::Module {
+//public:
+//	BiquadFilter() : z0(0.00005071144176722623), z1(0.00010142288353445246), z2(0.00005071144176722623), p1(-1.9983734580395864), p2(0.9985763038066554) {};
+//	//{ 0.9329157274413206 , -1.8658314548826411 , 0.9329157274413206 , -1.7732296471466154, 0.9584332626186669 }
+//	BiquadFilter(double z0_, double z1_, double z2_, double p1_, double p2_) : z0(z0_), z1(z1_), z2(z2_), p1(p1_), p2(p2_) {};
+//	double z0 = 0.0;
+//	double z1 = 0.0;
+//	double z2 = 0.0;
+//	double p1 = 0.0;
+//	double p2 = 0.0;
+//
+//	olc::sound::synth::Property input;
+//	olc::sound::synth::Property output;
+//
+//	std::array<double, 2> i_state = {};
+//	std::array<double, 2> o_state = {};
+//
+//	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+//		double out = (input.value * z0) + (i_state[0] * z1) + (i_state[0] * z2) - (o_state[0] * p1) - (o_state[1] * p2);
+//		o_state[1] = o_state[0];
+//		i_state[1] = i_state[0];
+//		o_state[0] = out;
+//		i_state[0] = input.value;
+//
+//		output.value = out;
+//	}
+//};
 
 //A simple mixer with N inputs
 template<size_t N>
@@ -51,6 +88,7 @@ private:
 	double max_delay = static_cast<double>(max_ms) / 1000.0;
 	size_t input_index = 0;
 	size_t output_index = 1;
+public:
 	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
 		state[input_index] = input.value * decay.value;
 		input_index = (input_index + 1) % state.size();
@@ -80,7 +118,7 @@ public:
 
 class Gain : public olc::sound::synth::Module {
 private:
-	double max_gain = 2;
+	double max_gain = 6;
 public:
 	olc::sound::synth::Property gain = 1.0;
 	olc::sound::synth::Property input = 0.0;
@@ -158,10 +196,10 @@ private:
 
 public:
 	olc::sound::synth::Property mInput = 0.0;
-	olc::sound::synth::Property mAttack = 0.0f;
+	olc::sound::synth::Property mAttack = 0.00f;
 	olc::sound::synth::Property mDecay = 0.00f;
 	olc::sound::synth::Property mSustain = 1.0f;
-	olc::sound::synth::Property mRelease = 1.0f;
+	double mRelease = 1.0f;
 	//double mRelease = 4.0f;
 	olc::sound::synth::Property mAmplitude = 0.0f;
 	olc::sound::synth::Property mReleaseAmplitude = 0.00f;
@@ -208,7 +246,7 @@ public:
 			mState = ADSR_STATE::RELEASE;
 			break;
 		case ADSR_STATE::RELEASE:
-			mAmplitude = map<>(mReleaseTime.value, mReleaseTime.value + mRelease.value, mReleaseAmplitude.value, 0.0, mTotalTime);
+			mAmplitude = map<>(mReleaseTime.value, mReleaseTime.value + mRelease, mReleaseAmplitude.value, 0.0, mTotalTime);
 			break;
 			//No default as all cases are taken care of
 		}
@@ -216,6 +254,188 @@ public:
 		mOutput = mAmplitude.value * mInput.value;
 	}
 };
+
+
+//BEGIN THUNDER CODE
+//This is the beginning of some thunder sound code from a paper
+//that was sent to me.  This singular section is about generating
+//the initial "crack" which it kind of does.  It meshed well with what
+//I had already done so I left it in
+
+//This has significant problem with nans leaking into the filter
+//So there is some code elsewhere to clean them out
+class TimeVaryingBPFilter : public olc::sound::synth::Module {
+public:
+	BiquadFilter filter;
+
+	double fc = 500.0;
+	double trigger_time;
+	double d_time = -0.1;
+	double d_prime;
+
+	void SetCoefficients(double Fc, double Fs, double Q) {
+		double K = std::tan(3.14159265359 * (Fc / Fs));
+		double norm = 1 / (1 + (K / Q) + (K * K));
+		filter.z0 = (K / Q) * norm;
+		filter.z1 = 0;
+		filter.z2 = -filter.z0;
+		filter.p1 = 2 * (K * K - 1) * norm;
+		filter.p2 = (1 - (K / Q) + (K * K)) * norm;
+	}
+
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		double Fc = map(d_time, d_prime, fc, fc / 2.0, dTime);
+		SetCoefficients(Fc, samplerate, 10.0);
+		filter.Update(nChannel, dTime, dTimeStep);
+	}
+};
+
+class StrikeEnvelope : public olc::sound::synth::Module {
+public:
+	double P_strike_intensity = 1.0;
+	double P_strike_distance = 1.0;
+	double max_gain = 2.0;
+	double d;
+	double d_prime;
+
+	double trigger_time;
+	double d_Time;
+
+	olc::sound::synth::Property input;
+	olc::sound::synth::Property output;
+
+	TimeVaryingBPFilter Hbp1;
+	TimeVaryingBPFilter Hbp2;
+
+	void Trigger() {
+		double r = rand_float();
+		trigger_time = d_Time;
+		d = d_Time + (rand_float() * 10) / 343;
+		double temp = std::pow(1.4 - r, 5) * 140;
+		d_prime = d + temp / 1000;
+
+		//Configure filters
+		Hbp1.fc = 100 + rand_float() * 1200.0;
+		Hbp2.fc = 100 + rand_float() * 1200.0;
+		Hbp1.d_time = d_Time;
+		Hbp2.d_time = d_Time;
+		Hbp1.d_prime = d_prime;
+		Hbp2.d_prime = d_prime;
+
+		//Clear the out state of any nan values
+		Hbp1.filter.o_state = { 0, 0 };
+		Hbp2.filter.o_state = { 0, 0 };
+	}
+
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		double gain = 0.0;
+		d_Time = dTime;
+		if (dTime < d) {
+			gain = map(trigger_time, d, 0.0, max_gain, dTime);
+		}
+		else if (dTime < d_prime) {
+			gain = map(d, d_prime, max_gain, 0.0, dTime);
+		}
+		else {
+			gain = 0.0;
+		}
+
+		Hbp1.filter.input = input.value * gain;
+		Hbp2.filter.input = input.value * gain;
+		Hbp1.Update(nChannel, dTime, dTimeStep);
+		Hbp2.Update(nChannel, dTime, dTimeStep);
+
+		output = 100 * (Hbp1.filter.output.value + Hbp2.filter.output.value) / 2.0;
+	}
+};
+template<size_t N>
+class Splitter : public olc::sound::synth::Module {
+public:
+	olc::sound::synth::Property input;
+	std::array<olc::sound::synth::Property, N> output;
+
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		for (int i = 0; i < N; i++) {
+			output[i] = input.value;
+		}
+	}
+
+};
+
+class LightningStrike : public olc::sound::synth::Module {
+public:
+	olc::sound::synth::ModularSynth mSynth;
+
+	std::array<Splitter<4>, 6> StrikeSplitters;
+	std::array<std::array<StrikeEnvelope, 4>, 6> StrikeEnvelopes;
+
+	std::array<Mixer<4>, 6> StrikeMixers;
+
+	std::array<olc::sound::synth::modules::Oscillator, 6> X;
+	Mixer<6> L_mixer;
+
+	olc::sound::synth::Property output = 0.0;
+
+	double max_mag = 0;
+
+	LightningStrike() {
+		for (int i = 0; i < 6; i++) {
+			if (i % 2 == 0) {
+				X[i].waveform = olc::sound::synth::modules::Oscillator::Type::PWM;
+				X[i].frequency = 1000 / 20000;
+				X[i].parameter = 0.9;
+			}
+			else {
+				X[i].waveform = olc::sound::synth::modules::Oscillator::Type::Noise;
+			}
+			mSynth.AddModule(&X[i]);
+			mSynth.AddModule(&StrikeSplitters[i]);
+			mSynth.AddPatch(&X[i].output, &StrikeSplitters[i].input);
+
+			for (int j = 0; j < 4; j++) {
+				mSynth.AddModule(&StrikeEnvelopes[i][j]);
+				mSynth.AddPatch(&StrikeSplitters[i].output[j], &StrikeEnvelopes[i][j].input);
+				mSynth.AddPatch(&StrikeEnvelopes[i][j].output, &StrikeMixers[i].inputs[j]);
+				StrikeMixers[i].amplitude[j] = 1.0;
+			}
+			mSynth.AddModule(&StrikeMixers[i]);
+			mSynth.AddPatch(&StrikeMixers[i].output, &L_mixer.inputs[i]);
+		}
+		mSynth.AddModule(&L_mixer);
+	}
+
+	void Trigger() {
+		for (int i = 0; i < 6; i++) {
+			for (int j = 0; j < 4; j++) {
+				StrikeEnvelopes[i][j].Trigger();
+			}
+		}
+	}
+
+	void SetLCount(int count) {
+		int c = std::max(1, std::min(6, count));
+
+		for (int i = 0; i < c; i++) {
+			L_mixer.amplitude[i] = 1.0;
+		}
+
+		for (int i = c; i < 6; i++) {
+			L_mixer.amplitude[i] = 0.0;
+		}
+	}
+
+	virtual void Update(uint32_t nChannel, double dTime, double dTimeStep) override {
+		mSynth.UpdatePatches();
+		mSynth.Update(nChannel, dTime, dTimeStep);
+		max_mag = std::max(max_mag, std::abs(L_mixer.output.value));
+		output = L_mixer.output.value;
+	}
+};
+
+//END THUNDER CODE
+
+
+
 
 struct LineSegment {
 	olc::vf2d start;
@@ -227,11 +447,8 @@ olc::vf2d MidPoint(const olc::vf2d s, const olc::vf2d e) {
 	return (s + e) / 2.0f;
 }
 
-float rand_float() {
-	return ((float)rand()) / RAND_MAX;
-}
 
-const uint32_t samplerate = 44100;
+
 const float split_chance = 0.3f;
 const float split_alpha_mod = 0.5f;
 const olc::Pixel white = { 255, 255, 255, 255 };
@@ -319,6 +536,7 @@ std::vector<olc::vf2d> collision_points = {
 { 3 , 0 },
 { 3 , 1 },
 };
+Delay<2000, samplerate> delay;
 
 enum class eMode {
 	START, //The beginning of the game
@@ -356,20 +574,51 @@ public:
 		}
 
 		osc1.waveform = olc::sound::synth::modules::Oscillator::Type::Noise;
-		osc2.waveform = olc::sound::synth::modules::Oscillator::Type::Saw;
+		osc2.waveform = olc::sound::synth::modules::Oscillator::Type::Sine;
 
 		osc1.frequency = .25;
 		osc1.amplitude = 1.0;
 		osc1.parameter = 0.5;
 
 		osc1.amplitude = 1.0;
+		osc2.amplitude = 1.0;
+		osc2.frequency = 1.0 / 20000;
 
 		adsr2.mRelease = 2.5;
-		mixer.amplitude[0] = 1.0;
-		mixer.amplitude[1] = 1.0;
+		mixer.amplitude[0] = .20;
+		mixer.amplitude[1] = .20;
 		mixer.amplitude[2] = 1.0;
+		mixer.amplitude[3] = .20;
 
 		delay.decay = .55;
+
+		rumbles[0].Configure(samplerate, 23, 20, 1, BiquadFilter::Type::LowPass);
+		rumbles[1].Configure(samplerate, 47, 20, 1, BiquadFilter::Type::LowPass);
+		rumbles[2].Configure(samplerate, 61, 20, 1, BiquadFilter::Type::LowPass);
+		rumbles[3].Configure(samplerate, 97, 20, 1, BiquadFilter::Type::LowPass);
+		rumbles[4].Configure(samplerate, 113, 20, 1, BiquadFilter::Type::LowPass);
+
+		rumbles_osc[0].frequency = 0.11 / 20000;
+		rumbles_osc[1].frequency = 0.07 / 20000;
+		rumbles_osc[2].frequency = 0.05 / 20000;
+		rumbles_osc[3].frequency = 0.03 / 20000;
+		rumbles_osc[4].frequency = 0.02 / 20000;
+
+		for (int i = 0; i < 5; i++) {
+			synth.AddModule(&rumbles[i]);
+			synth.AddModule(&rumbles_osc[i]);
+			synth.AddPatch(&rumbles_osc[i].output, &rumble_mixer.amplitude[i]);
+			synth.AddPatch(&rumbles[i].output, &rumble_mixer.inputs[i]);
+		}
+
+		synth.AddModule(&rumble_mixer);
+
+		final_output.amplitude[0] = 1.0;
+		final_output.amplitude[1] = 1.0;
+
+
+
+		lpf.Configure(samplerate, 100.0, 10, 6, BiquadFilter::Type::LowPass);
 
 		synth.AddModule(&osc1);
 		synth.AddModule(&osc2);
@@ -380,16 +629,37 @@ public:
 		synth.AddModule(&mixer);
 		synth.AddModule(&lpf);
 		synth.AddModule(&gain);
+		synth.AddModule(&ls);
+		synth.AddModule(&final_output);
 
-		synth.AddPatch(&osc1.output, &delay.input);
+		//synth.AddPatch(&osc2.output, &mixer.amplitude[2]);
+		//synth.AddPatch(&osc2.output, &mixer.amplitude[1]);
+		/*synth.AddPatch(&osc1.output, &delay.input);
 		synth.AddPatch(&osc1.output, &mixer.inputs[0]);
-		synth.AddPatch(&osc1.output, &lpf.input);
+		synth.AddPatch(&osc1.output, &lpf.input);*/
+		synth.AddPatch(&osc1.output, &pink_filter.input);
+		synth.AddPatch(&pink_filter.output, &mixer.inputs[0]);
+		synth.AddPatch(&pink_filter.output, &lpf.input);
+
+		synth.AddPatch(&pink_filter.output, &rumbles[0].input);
+		synth.AddPatch(&pink_filter.output, &rumbles[1].input);
+		synth.AddPatch(&pink_filter.output, &rumbles[2].input);
+		synth.AddPatch(&pink_filter.output, &rumbles[3].input);
+		synth.AddPatch(&pink_filter.output, &rumbles[4].input);
+
+		synth.AddPatch(&pink_filter.output, &delay.input);
 		synth.AddPatch(&delay.output, &mixer.inputs[1]);
-		synth.AddPatch(&lpf.output, &mixer.inputs[2]);
+		synth.AddPatch(&rumble_mixer.output, &mixer.inputs[2]);
+		synth.AddPatch(&ls.output, &mixer.inputs[3]);
 		synth.AddPatch(&mixer.output, &gain.input);
-		synth.AddPatch(&gain.output, &pink_filter.input);
-		synth.AddPatch(&pink_filter.output, &adsr.mInput);
+		synth.AddPatch(&gain.output, &adsr.mInput);
+		/*synth.AddPatch(&gain.output, &pink_filter.input);
+		synth.AddPatch(&pink_filter.output, &adsr.mInput);*/
 		synth.AddPatch(&adsr.mOutput, &adsr2.mInput);
+		synth.AddPatch(&adsr2.mOutput, &final_output.inputs[0]);
+		synth.AddPatch(&rumble_mixer.output, &final_output.inputs[1]);
+
+		ls.SetLCount(6);
 
 		engine.InitialiseAudio(samplerate, 1, 8, 512);
 
@@ -417,7 +687,9 @@ public:
 		//synth.Update(nChannel, dTime, dTime - last_time);
 		synth.Update(nChannel, dTime, 1.0 / 44100.0);
 		last_time = dTime;
-		return adsr2.mOutput.value;
+		//return ls.output.value;
+		//return adsr2.mOutput.value;
+		return final_output.output.value;
 	}
 
 
@@ -428,10 +700,15 @@ public:
 	ADSREnvelope adsr;
 	ADSREnvelope adsr2;
 	Pinkifier pink_filter;
-	Delay<2000, samplerate> delay;
-	Mixer<3> mixer;
-	LPF lpf;
+	Mixer<5> mixer;
+	BiquadFilter lpf;
+	std::array<BiquadFilter, 5> rumbles;
+	Mixer<5> rumble_mixer;
+	Mixer<2> final_output;
+	std::array<olc::sound::synth::modules::Oscillator, 5> rumbles_osc;
 	Gain gain;
+	LightningStrike ls;
+	//BiquadFilter lpf = { 0.9329157274413206 , -1.8658314548826411 , 0.9329157274413206 , -1.7732296471466154, 0.9584332626186669 };
 
 	int times_called = 0;
 
@@ -446,15 +723,18 @@ public:
 
 	float fTotalTime = 0.0f;
 	float fStateTimer = 0.0f;
-	float fIdleThreshold = 4.0f;
-	float fIdleThresholdMax = 4.0f;
+	float fIdleThreshold = 3.0f;
+	float fIdleThresholdMax = 3.0f;
 	float fHintThreshold = 1.0f;
+	float fMaxHintThreshold = 1.0f;
 	float fTriggerThreshold = .5f;
-	float fShowThreshold = 2.0f;
+	float fShowThreshold = 1.0f;
+	float fMaxShowThreshold = 1.0f;
 	float fFadeoutThreshold = 0.3f;
+	float fMaxFadeoutThreshold = 0.3f;
 
 
-	float fSpeed = 19.0f;
+	float fSpeed = 23.0f;
 
 	int bolts_dodged = 0;
 
@@ -467,8 +747,8 @@ public:
 		fIdleThreshold = fIdleThresholdMax;
 		fHintThreshold = 1.0f;
 		fTriggerThreshold = .5f;
-		fShowThreshold = 2.0f;
-		fFadeoutThreshold = 0.3f;
+		fShowThreshold = fMaxShowThreshold;
+		fFadeoutThreshold = fMaxFadeoutThreshold;
 		bolts_dodged = 0;
 		mode = eMode::IDLE;
 	}
@@ -529,7 +809,7 @@ public:
 	//After dodging a bolt the player is given a few seconds
 	//to prepare for the next bolt.  Nothing happens during
 	//this state.
-	//At the end of the state, a ne bolt is generated and we
+	//At the end of the state, a new bolt is generated and we
 	//proceed to the Hint state
 	void IdleFunction(float fElapsedTime) {
 		HandleMovement(fElapsedTime);
@@ -551,16 +831,25 @@ public:
 			float limit = r * 6 + 4;
 
 			delay.delay = 0.1 + r * (0.9);
-			mixer.amplitude[2] = rand_float();
-			gain.gain = r;
+			//mixer.amplitude[2] = rand_float();
+			gain.gain = 1;
+			ls.SetLCount(1 + floor(r * 6));
 
-			fTriggerThreshold = 0.1f + r / 10.0f;
+			
 
 			for (float i = 0; i < limit; i += 1) {
 				bolt.Iterate();
 			}
 
-			fIdleThreshold = std::max(.50f, fIdleThresholdMax - bolts_dodged * 0.1f);
+			fHintThreshold = std::max(0.5, fMaxHintThreshold - bolts_dodged * 0.005);
+			fTriggerThreshold = 0.1f + r / 10.0f;
+			fShowThreshold = std::max(0.1f, fMaxShowThreshold - bolts_dodged * 0.01f);
+			fFadeoutThreshold = std::max(0.075f, fMaxFadeoutThreshold - bolts_dodged * 0.0011f);
+			fIdleThreshold = std::max(.10f, fIdleThresholdMax - bolts_dodged * 0.1f);
+
+			adsr.mRelease = fShowThreshold + fFadeoutThreshold;
+			adsr2.mRelease = fShowThreshold + fFadeoutThreshold;
+
 		}
 	}
 
@@ -574,10 +863,11 @@ public:
 			mode = eMode::TRIGGER;
 			adsr.Begin();
 			adsr2.Begin();
+			ls.Trigger();
 		}
 
 		for (const auto& s : bolt.segments) {
-			if ((hint_point - s.start).mag2() < (2500 * fStateTimer)) {
+			if ((hint_point - s.start).mag2() < (2500 * fStateTimer / fHintThreshold)) {
 				olc::Pixel c = { s.color.r, s.color.g, s.color.b, (uint8_t)(s.color.a * 0.25f) };
 				DrawLine(s.start, s.end, c);
 			}
@@ -609,7 +899,7 @@ public:
 		if (fStateTimer > fShowThreshold) {
 			fStateTimer -= fShowThreshold;
 			mode = eMode::FADEOUT;
-			fShowThreshold = std::max(0.5f, 2.0f - bolts_dodged * 0.007f);
+			
 
 		}
 		for (const auto& s : bolt.segments) {
@@ -632,8 +922,6 @@ public:
 		if (fStateTimer > fFadeoutThreshold) {
 			fStateTimer -= fFadeoutThreshold;
 			bolts_dodged += 1;
-
-			fFadeoutThreshold = std::max(0.075f, 0.3f - bolts_dodged * 0.0011f);
 			mode = eMode::IDLE;
 		}
 
@@ -764,6 +1052,7 @@ public:
 		//DrawString(20, 40, std::to_string(adsr.mTotalTime));
 		//DrawString(20, 50, std::to_string(times_called));
 		//DrawString(20, 60, std::to_string(fTotalTime));
+		//DrawString(20, 60, std::to_string(ls.max_mag));
 		//DrawString(20, 70, std::to_string(fTotalTime*44100));
 
 		if (dead) {
